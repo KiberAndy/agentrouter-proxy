@@ -1,0 +1,17 @@
+{
+  "name": "agentrouter-proxy",
+  "version": "5.0.0",
+  "description": "OpenAI-compatible proxy for Agent Router — one .exe, no dependencies",
+  "main": "dist/proxy.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/proxy.js",
+    "dev": "npx ts-node src/proxy.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.exe
+*.blob
+*.log
+config.txt
+proxy-errors.log
