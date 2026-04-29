@@ -18,37 +18,46 @@ const c = {
 // ─── Config ───
 interface Config { port: number; agentRouterUrl: string; timeoutMs: number; }
 
+const CONFIG_DEFAULTS: Config = { port: 3001, agentRouterUrl: 'https://agentrouter.org/v1', timeoutMs: 120_000 };
+const CONFIG_TEMPLATE = `# Agent Router Proxy — Настройки\nPORT=3001\nAGENT_ROUTER_URL=https://agentrouter.org/v1\nTIMEOUT_MS=120000\n`;
+
+function applyPort(result: Config, val: string): void {
+  const p = Number.parseInt(val, 10);
+  if (Number.isNaN(p) || p < 1 || p > 65535) console.warn(`  ${c.yellow}⚠ Неверный PORT="${val}", использую 3001${c.reset}`);
+  else result.port = p;
+}
+
+function applyUrl(result: Config, val: string): void {
+  try { new URL(val); result.agentRouterUrl = val; }
+  catch { console.warn(`  ${c.yellow}⚠ Неверный AGENT_ROUTER_URL="${val}", использую дефолт${c.reset}`); }
+}
+
+function applyTimeout(result: Config, val: string): void {
+  const p = Number.parseInt(val, 10);
+  if (Number.isNaN(p) || p < 1000) console.warn(`  ${c.yellow}⚠ Неверный TIMEOUT_MS="${val}", использую 120000${c.reset}`);
+  else result.timeoutMs = p;
+}
+
+function parseConfigLine(result: Config, line: string): void {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith('#')) return;
+  const eqIdx = trimmed.indexOf('=');
+  if (eqIdx < 0) return;
+  const key = trimmed.slice(0, eqIdx).trim();
+  const val = trimmed.slice(eqIdx + 1).trim();
+  if (key === 'PORT') applyPort(result, val);
+  else if (key === 'AGENT_ROUTER_URL') applyUrl(result, val);
+  else if (key === 'TIMEOUT_MS') applyTimeout(result, val);
+}
+
 function readConfig(): Config {
-  const defaults: Config = { port: 3001, agentRouterUrl: 'https://agentrouter.org/v1', timeoutMs: 120_000 };
-
   if (!fs.existsSync(CONFIG_PATH)) {
-    fs.writeFileSync(CONFIG_PATH, `# Agent Router Proxy — Настройки\nPORT=3001\nAGENT_ROUTER_URL=https://agentrouter.org/v1\nTIMEOUT_MS=120000\n`, 'utf-8');
-    return defaults;
+    fs.writeFileSync(CONFIG_PATH, CONFIG_TEMPLATE, 'utf-8');
+    return { ...CONFIG_DEFAULTS };
   }
-
-  const result = { ...defaults };
+  const result = { ...CONFIG_DEFAULTS };
   for (const line of fs.readFileSync(CONFIG_PATH, 'utf-8').split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIdx = trimmed.indexOf('=');
-    if (eqIdx < 0) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    const val = trimmed.slice(eqIdx + 1).trim();
-
-    if (key === 'PORT') {
-      const p = parseInt(val, 10);
-      if (isNaN(p) || p < 1 || p > 65535) console.warn(`  ${c.yellow}⚠ Неверный PORT="${val}", использую 3001${c.reset}`);
-      else result.port = p;
-    }
-    if (key === 'AGENT_ROUTER_URL') {
-      try { new URL(val); result.agentRouterUrl = val; }
-      catch { console.warn(`  ${c.yellow}⚠ Неверный AGENT_ROUTER_URL="${val}", использую дефолт${c.reset}`); }
-    }
-    if (key === 'TIMEOUT_MS') {
-      const p = parseInt(val, 10);
-      if (isNaN(p) || p < 1000) console.warn(`  ${c.yellow}⚠ Неверный TIMEOUT_MS="${val}", использую 120000${c.reset}`);
-      else result.timeoutMs = p;
-    }
+    parseConfigLine(result, line);
   }
   return result;
 }
@@ -122,11 +131,20 @@ const AR_HEADERS = {
   'sec-fetch-mode': 'cors',
 };
 
+// ─── Safe URL builder (no string concatenation of user-controlled paths) ───
+function buildTargetUrl(baseUrl: string, urlPath: string): string {
+  const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
+  const safePath = urlPath.startsWith('/') ? urlPath : `/${urlPath}`;
+  // Validate path contains only allowed characters to prevent injection
+  const clean = safePath.replace(/[^a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]/g, '');
+  return `${base}${clean}`;
+}
+
 async function callAR(baseUrl: string, urlPath: string, authHeader: string, timeoutMs: number, body?: string): Promise<{ status: number; body: string }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(`${baseUrl}${urlPath}`, {
+    const response = await fetch(buildTargetUrl(baseUrl, urlPath), {
       method: body !== undefined ? 'POST' : 'GET',
       headers: { ...AR_HEADERS, 'Authorization': authHeader, 'Accept': 'application/json' },
       body,
@@ -146,7 +164,7 @@ async function callARStream(baseUrl: string, urlPath: string, authHeader: string
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(`${baseUrl}${urlPath}`, {
+    const response = await fetch(buildTargetUrl(baseUrl, urlPath), {
       method: 'POST',
       headers: { ...AR_HEADERS, 'Authorization': authHeader, 'Accept': 'text/event-stream' },
       body,
