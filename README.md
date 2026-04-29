@@ -101,7 +101,7 @@ AGENT_ROUTER_URL=https://agentrouter.org/v1
 
 ```bash
 # Клонируй
-git clone https://github.com/YOUR_USERNAME/agentrouter-proxy.git
+git clone https://github.com/b24039971/agentrouter-proxy.git
 cd agentrouter-proxy
 
 # Установи зависимости
