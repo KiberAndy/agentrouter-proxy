@@ -1,7 +1,6 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import readline from 'node:readline';
 
 // ─── Resolve paths relative to the .exe (or script) location ───
 const EXE_DIR = path.dirname(process.execPath.endsWith('.exe') ? process.execPath : process.argv[1]);
@@ -10,60 +9,48 @@ const LOG_PATH = path.join(EXE_DIR, 'proxy-errors.log');
 
 // ─── Colors for console ───
 const c = {
-  reset: '\x1b[0m',
-  bright: '\x1b[1m',
-  dim: '\x1b[2m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  cyan: '\x1b[36m',
-  red: '\x1b[31m',
-  magenta: '\x1b[35m',
-  white: '\x1b[37m',
-  bgBlue: '\x1b[44m',
+  reset: '\x1b[0m', bright: '\x1b[1m', dim: '\x1b[2m',
+  green: '\x1b[32m', yellow: '\x1b[33m', cyan: '\x1b[36m',
+  red: '\x1b[31m', magenta: '\x1b[35m', white: '\x1b[37m',
   bgGreen: '\x1b[42m',
-  bgRed: '\x1b[41m',
 };
 
 // ─── Config ───
-interface Config {
-  port: number;
-  agentRouterUrl: string;
-}
+interface Config { port: number; agentRouterUrl: string; timeoutMs: number; }
 
 function readConfig(): Config {
-  const defaults: Config = {
-    port: 3001,
-    agentRouterUrl: 'https://agentrouter.org/v1',
-  };
+  const defaults: Config = { port: 3001, agentRouterUrl: 'https://agentrouter.org/v1', timeoutMs: 120_000 };
 
   if (!fs.existsSync(CONFIG_PATH)) {
-    // Create default config.txt
-    const template = `# ═══════════════════════════════════════════════
-# Agent Router Proxy — Настройки
-# ═══════════════════════════════════════════════
-
-# Порт прокси (по умолчанию 3001)
-PORT=3001
-
-# URL Agent Router API (менять обычно не нужно)
-AGENT_ROUTER_URL=https://agentrouter.org/v1
-`;
-    fs.writeFileSync(CONFIG_PATH, template, 'utf-8');
+    fs.writeFileSync(CONFIG_PATH, `# Agent Router Proxy — Настройки\nPORT=3001\nAGENT_ROUTER_URL=https://agentrouter.org/v1\nTIMEOUT_MS=120000\n`, 'utf-8');
     return defaults;
   }
 
-  const text = fs.readFileSync(CONFIG_PATH, 'utf-8');
-  for (const line of text.split('\n')) {
+  const result = { ...defaults };
+  for (const line of fs.readFileSync(CONFIG_PATH, 'utf-8').split('\n')) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) continue;
     const eqIdx = trimmed.indexOf('=');
     if (eqIdx < 0) continue;
     const key = trimmed.slice(0, eqIdx).trim();
     const val = trimmed.slice(eqIdx + 1).trim();
-    if (key === 'PORT') defaults.port = parseInt(val, 10) || 3001;
-    if (key === 'AGENT_ROUTER_URL') defaults.agentRouterUrl = val;
+
+    if (key === 'PORT') {
+      const p = parseInt(val, 10);
+      if (isNaN(p) || p < 1 || p > 65535) console.warn(`  ${c.yellow}⚠ Неверный PORT="${val}", использую 3001${c.reset}`);
+      else result.port = p;
+    }
+    if (key === 'AGENT_ROUTER_URL') {
+      try { new URL(val); result.agentRouterUrl = val; }
+      catch { console.warn(`  ${c.yellow}⚠ Неверный AGENT_ROUTER_URL="${val}", использую дефолт${c.reset}`); }
+    }
+    if (key === 'TIMEOUT_MS') {
+      const p = parseInt(val, 10);
+      if (isNaN(p) || p < 1000) console.warn(`  ${c.yellow}⚠ Неверный TIMEOUT_MS="${val}", использую 120000${c.reset}`);
+      else result.timeoutMs = p;
+    }
   }
-  return defaults;
+  return result;
 }
 
 // ─── Scrubbing ───
@@ -72,7 +59,6 @@ const SCRUB_PATTERNS: Array<[RegExp, string]> = [
   [/russia[_\-\s]*vpn[_\-\s]*\w*/gi, 'session_x'],
   [/sender=[\w\-]+/g, 'sender=user'],
 ];
-
 function scrub(body: string): string {
   let out = body;
   for (const [re, repl] of SCRUB_PATTERNS) out = out.replace(re, repl);
@@ -86,10 +72,8 @@ const MODEL_PREFIX_MAP: Record<string, string> = {
   '/glm': 'glm-5.1',
   '/opus': 'claude-opus-4-6',
 };
-
 const SENSITIVE_RE = /sensitive_words_detected|sensitive words detected|content[_-]?blocked/i;
 const RATE_LIMIT_RE = /Too Many Requests|总请求数限制|rate.?limit/i;
-
 type Attempt = { model: string; reduce: boolean };
 const ATTEMPTS: Attempt[] = [
   { model: 'claude-haiku-4-5-20251001', reduce: false },
@@ -105,59 +89,96 @@ function reduceMessages(body: string): string {
     const lastUser = [...msgs].reverse().find((m: any) => m.role === 'user');
     j.messages = [sys, lastUser].filter(Boolean);
     return JSON.stringify(j);
-  } catch {
-    return body;
-  }
+  } catch { return body; }
 }
 
 function logFailure(status: number, url: string, body: string, response: string) {
   try {
-    const ts = new Date().toISOString();
     fs.appendFileSync(LOG_PATH,
-      `\n=== ${ts} status=${status} url=${url} ===\nREQUEST BODY:\n${(body || '').slice(0, 4000)}\nRESPONSE:\n${response.slice(0, 800)}\n`);
+      `\n=== ${new Date().toISOString()} status=${status} url=${url} ===\nREQUEST:\n${(body||'').slice(0,4000)}\nRESPONSE:\n${response.slice(0,800)}\n`);
   } catch {}
 }
 
 // ─── Stats ───
-let totalRequests = 0;
-let successRequests = 0;
-let failedRequests = 0;
-let startTime = Date.now();
-
-// ─── Call Agent Router ───
-async function callAR(baseUrl: string, urlPath: string, authHeader: string, body?: string): Promise<{ status: number; body: string }> {
-  const targetUrl = `${baseUrl}${urlPath}`;
-  const response = await fetch(targetUrl, {
-    method: body !== undefined ? 'POST' : 'GET',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': authHeader,
-      'Accept': 'application/json',
-      'User-Agent': 'QwenCode/0.12.6 (win32; x64)',
-      'x-stainless-lang': 'js',
-      'x-stainless-package-version': '5.11.0',
-      'x-stainless-os': 'Windows',
-      'x-stainless-arch': 'x64',
-      'x-stainless-runtime': 'node',
-      'x-stainless-runtime-version': 'v24.3.0',
-      'accept-language': '*',
-      'sec-fetch-mode': 'cors',
-    },
-    body,
-  });
-  return { status: response.status, body: await response.text() };
-}
-
+let totalRequests = 0, successRequests = 0, failedRequests = 0;
+const startTime = Date.now();
 function uptime(): string {
   const sec = Math.floor((Date.now() - startTime) / 1000);
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = sec % 60;
-  return `${h}h ${m}m ${s}s`;
+  return `${Math.floor(sec/3600)}h ${Math.floor((sec%3600)/60)}m ${sec%60}s`;
+}
+function timestamp(): string { return new Date().toLocaleTimeString('ru-RU', { hour12: false }); }
+
+// ─── [FIX #1] fetch с таймаутом ───
+const AR_HEADERS = {
+  'Content-Type': 'application/json',
+  'User-Agent': 'QwenCode/0.12.6 (win32; x64)',
+  'x-stainless-lang': 'js',
+  'x-stainless-package-version': '5.11.0',
+  'x-stainless-os': 'Windows',
+  'x-stainless-arch': 'x64',
+  'x-stainless-runtime': 'node',
+  'x-stainless-runtime-version': 'v24.3.0',
+  'accept-language': '*',
+  'sec-fetch-mode': 'cors',
+};
+
+async function callAR(baseUrl: string, urlPath: string, authHeader: string, timeoutMs: number, body?: string): Promise<{ status: number; body: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${baseUrl}${urlPath}`, {
+      method: body !== undefined ? 'POST' : 'GET',
+      headers: { ...AR_HEADERS, 'Authorization': authHeader, 'Accept': 'application/json' },
+      body,
+      signal: controller.signal,
+    });
+    return { status: response.status, body: await response.text() };
+  } catch (err: any) {
+    if (err.name === 'AbortError') return { status: 504, body: JSON.stringify({ error: { message: `Timeout after ${timeoutMs}ms`, type: 'timeout' } }) };
+    return { status: 502, body: JSON.stringify({ error: { message: err.message, type: 'network_error' } }) };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-function timestamp(): string {
-  return new Date().toLocaleTimeString('ru-RU', { hour12: false });
+// ─── [FIX #2] SSE стриминг ───
+async function callARStream(baseUrl: string, urlPath: string, authHeader: string, timeoutMs: number, body: string, res: http.ServerResponse): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${baseUrl}${urlPath}`, {
+      method: 'POST',
+      headers: { ...AR_HEADERS, 'Authorization': authHeader, 'Accept': 'text/event-stream' },
+      body,
+      signal: controller.signal,
+    });
+
+    if (!response.ok || !response.body) { clearTimeout(timer); return false; }
+
+    res.writeHead(response.status, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+    });
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(decoder.decode(value, { stream: true }));
+    }
+    clearTimeout(timer);
+    res.end();
+    return true;
+  } catch (err: any) {
+    clearTimeout(timer);
+    if (!res.headersSent) return false;
+    res.write(`data: ${JSON.stringify({ error: err.message })}\n\ndata: [DONE]\n\n`);
+    res.end();
+    return true;
+  }
 }
 
 // ─── Banner ───
@@ -165,36 +186,25 @@ function printBanner(config: Config) {
   console.clear();
   console.log(`
 ${c.cyan}${c.bright}  ╔═══════════════════════════════════════════════════════╗
-  ║         🔀  Agent Router Proxy  v5.0                 ║
-  ║         OpenAI-compatible proxy for AgentRouter      ║
+  ║         🔀  Agent Router Proxy  v5.1 (patched)       ║
   ╚═══════════════════════════════════════════════════════╝${c.reset}
 
   ${c.green}▸ Статус:${c.reset}     ${c.bgGreen}${c.bright} РАБОТАЕТ ${c.reset}
   ${c.green}▸ Порт:${c.reset}       ${c.bright}${config.port}${c.reset}
+  ${c.green}▸ Таймаут:${c.reset}    ${c.bright}${config.timeoutMs / 1000}s${c.reset}
   ${c.green}▸ Backend:${c.reset}    ${c.dim}${config.agentRouterUrl}${c.reset}
-  ${c.green}▸ Конфиг:${c.reset}    ${c.dim}${CONFIG_PATH}${c.reset}
-  ${c.green}▸ Логи:${c.reset}      ${c.dim}${LOG_PATH}${c.reset}
+  ${c.green}▸ Стриминг:${c.reset}  ${c.bright}✓ включён${c.reset}
 
-  ${c.yellow}── Как использовать ──────────────────────────────────${c.reset}
-  ${c.white}В вашем приложении (Cursor, Cline, и т.д.):${c.reset}
-
-    ${c.cyan}Base URL:${c.reset}  ${c.bright}http://localhost:${config.port}/v1${c.reset}
-    ${c.cyan}API Key:${c.reset}   ${c.bright}sk-ваш-ключ-от-agentrouter${c.reset}
+  ${c.yellow}── Base URL ──────────────────────────────────────────${c.reset}
+    ${c.cyan}http://localhost:${config.port}/v1${c.reset}
 
   ${c.yellow}── Модели через URL ─────────────────────────────────${c.reset}
-    ${c.dim}/haiku/chat/completions${c.reset}    → claude-haiku-4.5
-    ${c.dim}/opus/chat/completions${c.reset}     → claude-opus-4.6
-    ${c.dim}/deepseek/chat/completions${c.reset} → deepseek-v3.2
-    ${c.dim}/glm/chat/completions${c.reset}      → glm-5.1
+    ${c.dim}/haiku/v1${c.reset}    → claude-haiku-4.5
+    ${c.dim}/opus/v1${c.reset}     → claude-opus-4.6
+    ${c.dim}/deepseek/v1${c.reset} → deepseek-v3.2
+    ${c.dim}/glm/v1${c.reset}      → glm-5.1
 
-  ${c.yellow}── Авто-ретраи ──────────────────────────────────────${c.reset}
-    ${c.dim}#0 claude-haiku (полный контекст)${c.reset}
-    ${c.dim}#1 claude-haiku (урезанный контекст)${c.reset}
-    ${c.dim}#2 deepseek-v3.2 (фоллбэк)${c.reset}
-
-  ${c.dim}─────────────────────────────────────────────────────${c.reset}
   ${c.dim}Нажмите Ctrl+C чтобы остановить${c.reset}
-  ${c.dim}─────────────────────────────────────────────────────${c.reset}
 `);
 }
 
@@ -207,120 +217,94 @@ async function main() {
     const reqNum = totalRequests;
     const ts = timestamp();
 
-    // CORS preflight
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      });
-      res.end();
-      return;
+      res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization' });
+      res.end(); return;
     }
-
-    // Health check
     if (req.method === 'GET' && req.url === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, uptime: uptime(), requests: totalRequests, success: successRequests, failed: failedRequests }));
-      return;
+      res.end(JSON.stringify({ ok: true, uptime: uptime(), requests: totalRequests, success: successRequests, failed: failedRequests })); return;
     }
-
-    // Stats endpoint
     if (req.method === 'GET' && req.url === '/stats') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ uptime: uptime(), totalRequests, successRequests, failedRequests }));
-      return;
+      res.end(JSON.stringify({ uptime: uptime(), totalRequests, successRequests, failedRequests })); return;
     }
 
-    // Collect body
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
-    let body = Buffer.concat(chunks).toString() || undefined;
+    let body: string | undefined = Buffer.concat(chunks).toString() || undefined;
 
-    // Model prefix routing
     let url = req.url || '/';
     let forcedModel: string | undefined;
     for (const [prefix, model] of Object.entries(MODEL_PREFIX_MAP)) {
       if (url === prefix || url.startsWith(prefix + '/')) {
-        forcedModel = model;
-        url = url.slice(prefix.length) || '/';
-        break;
+        forcedModel = model; url = url.slice(prefix.length) || '/'; break;
       }
     }
 
     const authHeader = (req.headers.authorization as string) || '';
     const isChat = req.method === 'POST' && (url === '/chat/completions' || url.endsWith('/chat/completions'));
 
-    // Non-chat requests — simple forward
     if (!isChat) {
       console.log(`  ${c.dim}${ts}${c.reset} ${c.cyan}#${reqNum}${c.reset} ${req.method} ${url}`);
-      const r = await callAR(config.agentRouterUrl, url, authHeader, body);
-      if (r.status >= 400) {
-        failedRequests++;
-        logFailure(r.status, req.url || '', body || '', r.body);
-        console.log(`  ${c.dim}${ts}${c.reset} ${c.red}#${reqNum} ← ${r.status} ERROR${c.reset}`);
-      } else {
-        successRequests++;
-        console.log(`  ${c.dim}${ts}${c.reset} ${c.green}#${reqNum} ← ${r.status} OK${c.reset} ${c.dim}(${r.body.length}b)${c.reset}`);
-      }
+      const r = await callAR(config.agentRouterUrl, url, authHeader, config.timeoutMs, body);
+      if (r.status >= 400) { failedRequests++; logFailure(r.status, req.url||'', body||'', r.body); console.log(`  ${c.dim}${ts}${c.reset} ${c.red}#${reqNum} ← ${r.status} ERROR${c.reset}`); }
+      else { successRequests++; console.log(`  ${c.dim}${ts}${c.reset} ${c.green}#${reqNum} ← ${r.status} OK${c.reset} ${c.dim}(${r.body.length}b)${c.reset}`); }
       res.writeHead(r.status, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-      res.end(r.body);
-      return;
+      res.end(r.body); return;
     }
 
-    // Chat request — scrub + retry logic
     if (body) body = scrub(body);
+
+    // Detect streaming
+    let isStreaming = false;
+    if (body) { try { isStreaming = JSON.parse(body).stream === true; } catch {} }
 
     const attempts: Attempt[] = forcedModel ? [{ model: forcedModel, reduce: false }] : ATTEMPTS;
 
-    let lastStatus = 500;
-    let lastBody = '';
+    // ── Streaming path ──
+    if (isStreaming && body) {
+      const { model } = attempts[0];
+      let sBody = body;
+      try { const p = JSON.parse(body); p.model = model; sBody = JSON.stringify(p); } catch {}
+      console.log(`  ${c.dim}${ts}${c.reset} ${c.cyan}#${reqNum}${c.reset} ${c.magenta}→${c.reset} ${model.slice(0,15)} ${c.dim}[stream]${c.reset}`);
+      const done = await callARStream(config.agentRouterUrl, url, authHeader, config.timeoutMs, sBody, res);
+      if (done) { successRequests++; console.log(`  ${c.dim}${ts}${c.reset} ${c.green}#${reqNum} ← stream OK${c.reset}`); return; }
+      console.log(`  ${c.dim}${ts}${c.reset} ${c.yellow}#${reqNum} stream fail → ретрай без стриминга${c.reset}`);
+      try { const p = JSON.parse(body); p.stream = false; body = JSON.stringify(p); } catch {}
+    }
 
+    // ── Non-streaming / retry path ──
+    let lastStatus = 500, lastBody = '';
     for (let i = 0; i < attempts.length; i++) {
       const { model, reduce } = attempts[i];
-      let attemptBody = reduce && body ? reduceMessages(body) : body;
-      if (attemptBody) {
-        try {
-          const parsed = JSON.parse(attemptBody);
-          parsed.model = model;
-          attemptBody = JSON.stringify(parsed);
-        } catch {}
-      }
-
-      const modelShort = model.replace('claude-', '').replace('-20251001', '').slice(0, 12);
-      console.log(`  ${c.dim}${ts}${c.reset} ${c.cyan}#${reqNum}${c.reset} ${c.magenta}→${c.reset} ${modelShort} ${reduce ? c.yellow + '(reduced)' + c.reset : ''} ${c.dim}attempt ${i + 1}/${attempts.length}${c.reset}`);
-
-      const r = await callAR(config.agentRouterUrl, url, authHeader, attemptBody);
-      lastStatus = r.status;
-      lastBody = r.body;
+      let aBody = reduce && body ? reduceMessages(body) : body;
+      if (aBody) { try { const p = JSON.parse(aBody); p.model = model; aBody = JSON.stringify(p); } catch {} }
+      const short = model.replace('claude-','').replace('-20251001','').slice(0,12);
+      console.log(`  ${c.dim}${ts}${c.reset} ${c.cyan}#${reqNum}${c.reset} ${c.magenta}→${c.reset} ${short} ${reduce ? c.yellow+'(reduced)'+c.reset : ''} ${c.dim}#${i+1}/${attempts.length}${c.reset}`);
+      const r = await callAR(config.agentRouterUrl, url, authHeader, config.timeoutMs, aBody);
+      lastStatus = r.status; lastBody = r.body;
 
       if (r.status < 400) {
         successRequests++;
         let usage = '';
-        try {
-          const p = JSON.parse(r.body);
-          if (p.usage) usage = ` ${c.dim}${p.usage.prompt_tokens}→${p.usage.completion_tokens} tok${c.reset}`;
-        } catch {}
+        try { const p = JSON.parse(r.body); if (p.usage) usage = ` ${c.dim}${p.usage.prompt_tokens}→${p.usage.completion_tokens} tok${c.reset}`; } catch {}
         console.log(`  ${c.dim}${ts}${c.reset} ${c.green}#${reqNum} ← ${r.status} OK${c.reset} ${c.dim}(${r.body.length}b)${c.reset}${usage}`);
         res.writeHead(r.status, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-        res.end(r.body);
-        return;
+        res.end(r.body); return;
       }
 
-      logFailure(r.status, `${req.url} #${i} model=${model} reduce=${reduce}`, attemptBody || '', r.body);
-
+      logFailure(r.status, `${req.url} #${i} model=${model}`, aBody||'', r.body);
+      const isTimeout = r.status === 504;
       const isRateLimit = r.status === 429 || RATE_LIMIT_RE.test(r.body);
       const isContentBlock = SENSITIVE_RE.test(r.body);
       const isServerErr = r.status >= 500 && !isContentBlock;
-      const shouldContinue = !isRateLimit && (isContentBlock || isServerErr);
+      const shouldContinue = !isRateLimit && !isTimeout && (isContentBlock || isServerErr);
 
-      if (isRateLimit) {
-        console.log(`  ${c.dim}${ts}${c.reset} ${c.red}#${reqNum} ← 429 RATE LIMIT${c.reset} ${c.dim}(стоп)${c.reset}`);
-      } else if (isContentBlock) {
-        console.log(`  ${c.dim}${ts}${c.reset} ${c.yellow}#${reqNum} ← ${r.status} CONTENT BLOCKED${c.reset} ${shouldContinue ? c.dim + '(ретрай...)' + c.reset : ''}`);
-      } else {
-        console.log(`  ${c.dim}${ts}${c.reset} ${c.red}#${reqNum} ← ${r.status} ERROR${c.reset}`);
-      }
+      if (isTimeout) console.log(`  ${c.dim}${ts}${c.reset} ${c.red}#${reqNum} ← 504 TIMEOUT (стоп)${c.reset}`);
+      else if (isRateLimit) console.log(`  ${c.dim}${ts}${c.reset} ${c.red}#${reqNum} ← 429 RATE LIMIT (стоп)${c.reset}`);
+      else if (isContentBlock) console.log(`  ${c.dim}${ts}${c.reset} ${c.yellow}#${reqNum} ← CONTENT BLOCKED${shouldContinue ? ' (ретрай...)' : ''}${c.reset}`);
+      else console.log(`  ${c.dim}${ts}${c.reset} ${c.red}#${reqNum} ← ${r.status} ERROR${c.reset}`);
 
       if (!shouldContinue) break;
     }
@@ -331,18 +315,10 @@ async function main() {
   });
 
   printBanner(config);
-
-  server.listen(config.port, () => {
-    console.log(`  ${c.green}${c.bright}✓ Сервер запущен и слушает порт ${config.port}${c.reset}\n`);
-  });
-
+  server.listen(config.port, () => console.log(`  ${c.green}${c.bright}✓ Сервер запущен на порту ${config.port}${c.reset}\n`));
   server.on('error', (err: any) => {
-    if (err.code === 'EADDRINUSE') {
-      console.error(`\n  ${c.red}${c.bright}✗ Порт ${config.port} уже занят!${c.reset}`);
-      console.error(`  ${c.dim}Измените PORT в config.txt или закройте другую программу.${c.reset}\n`);
-    } else {
-      console.error(`\n  ${c.red}Ошибка сервера: ${err.message}${c.reset}\n`);
-    }
+    if (err.code === 'EADDRINUSE') console.error(`\n  ${c.red}✗ Порт ${config.port} занят!${c.reset}\n`);
+    else console.error(`\n  ${c.red}Ошибка: ${err.message}${c.reset}\n`);
     process.exit(1);
   });
 }
