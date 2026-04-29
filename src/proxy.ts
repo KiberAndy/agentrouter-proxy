@@ -70,7 +70,7 @@ const SCRUB_PATTERNS: Array<[RegExp, string]> = [
 ];
 function scrub(body: string): string {
   let out = body;
-  for (const [re, repl] of SCRUB_PATTERNS) out = out.replace(re, repl);
+  for (const [re, repl] of SCRUB_PATTERNS) out = out.replaceAll(re, repl);
   return out;
 }
 
